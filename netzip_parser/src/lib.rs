@@ -458,9 +458,10 @@ impl LocalFile {
         current_offset += file_name_length as usize;
 
         if extra_field_length > 0 {
-            local_file.extra_bytes = Some(
-                file_buf[current_offset..current_offset + extra_field_length as usize].to_vec(),
-            );
+            // Seems like some zip tools set invalid extra_field_length
+            // Possibly should set extra_bytes to None instead of trimming?
+            let end_offset = (current_offset + extra_field_length as usize).min(file_buf.len());
+            local_file.extra_bytes = Some(file_buf[current_offset..end_offset].to_vec());
         }
 
         Ok(local_file)

@@ -146,8 +146,15 @@ impl RemoteZip {
                 ))
                 .await?;
 
-            let lfh = LocalFile::parse(&lfh_bytes)
+            let mut lfh = LocalFile::parse(&lfh_bytes)
                 .map_err(|e| Error::ParserError(self.url.clone(), e))?;
+
+            // All these fields will always be zero when file was compressed with streaming
+            if lfh.gp_bit_flag >> 3 & 1 == 1 {
+                lfh.crc32 = cd_record.crc32;
+                lfh.compressed_size = cd_record.compressed_size;
+                lfh.uncompressed_size = cd_record.uncompressed_size;
+            }
 
             match lfh.compression_method {
                 netzip_parser::CompressionMethod::Deflate
