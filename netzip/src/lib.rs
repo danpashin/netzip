@@ -15,6 +15,8 @@ pub enum Error {
     DecompressionError(String, String),
     #[error("Unable to decompress file with compression type {0}")]
     UnsupportCompression(u16),
+    #[error("Downloaded data is corrupted. Expected {0} CRC-32 hash, got {1}")]
+    DataCorruption(u32, u32),
 }
 
 pub struct RemoteZip {
@@ -156,33 +158,56 @@ impl RemoteZip {
                 lfh.uncompressed_size = cd_record.uncompressed_size;
             }
 
+            // The set of extra fields in the CD do not need to be identical with LFH ones
+            // macOS has 16 bytes in LFH and 12 in CD
+            let data_offset = lfh_end_offset as u64 - cd_record.extra_field_length as u64
+                + lfh.extra_field_length as u64;
+
+            let mut compressed_size = lfh.compressed_size as u64;
+            let mut uncompressed_size = lfh.uncompressed_size as u64;
+
+            // zip64 sets these fields to 0xFFFFFFFF
+            if let Some(extended_info) = cd_record.zip64_extended_info() {
+                compressed_size = extended_info.compressed_size;
+                uncompressed_size = extended_info.uncompressed_size;
+            }
+
+            let download_chunk = |end_offset: u64| async move {
+                self.ranged_request(&format!(
+                    "bytes={}-{}",
+                    data_offset,
+                    data_offset as u64 + end_offset.saturating_sub(1)
+                ))
+                .await
+            };
+
+            let check_crc = |data: &[u8]| {
+                let checksum = crc32fast::hash(data);
+                if checksum != lfh.crc32 {
+                    return Err(Error::DataCorruption(lfh.crc32, checksum));
+                }
+
+                Ok(())
+            };
+
             match lfh.compression_method {
                 netzip_parser::CompressionMethod::Deflate
                 | netzip_parser::CompressionMethod::Deflate64 => {
-                    let compressed_data: &[u8] = &self
-                        .ranged_request(&format!(
-                            "bytes={}-{}",
-                            lfh_end_offset,
-                            lfh_end_offset + lfh.compressed_size
-                        ))
-                        .await?;
+                    let compressed_data: &[u8] = &download_chunk(compressed_size).await?;
 
                     let mut decoder = DeflateDecoder::new(compressed_data);
-                    let mut decoded = Vec::with_capacity(lfh.uncompressed_size as usize);
+                    let mut decoded = Vec::with_capacity(uncompressed_size as usize);
                     decoder
                         .read_to_end(&mut decoded)
                         .map_err(|e| Error::DecompressionError(self.url.clone(), e.to_string()))?;
 
+                    check_crc(&decoded)?;
+
                     out.push((lfh, decoded));
                 }
                 netzip_parser::CompressionMethod::Stored => {
-                    let data = &self
-                        .ranged_request(&format!(
-                            "bytes={}-{}",
-                            lfh_end_offset,
-                            lfh_end_offset + lfh.uncompressed_size
-                        ))
-                        .await?;
+                    let data = download_chunk(uncompressed_size).await?;
+                    check_crc(&data)?;
 
                     out.push((lfh, data.to_vec()));
                 }

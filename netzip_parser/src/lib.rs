@@ -1,8 +1,10 @@
+use scroll::Pread;
 use thiserror::Error;
 
 const MAGIC_CENTRAL_DIRECTORY_END: [u8; 4] = [0x50, 0x4B, 0x05, 0x06];
 const MAGIC_CENTRAL_DIRECTORY_RECORD: [u8; 4] = [0x50, 0x4B, 0x01, 0x02];
 const MAGIC_LOCAL_FILE: [u8; 4] = [0x50, 0x4B, 0x03, 0x04];
+const MAGIC_ZIP64_EIF: [u8; 2] = [0x01, 0x00];
 
 pub const EOCD_MIN_SIZE: usize = 22;
 const EOCD_BASE_OFFSET: usize = MAGIC_CENTRAL_DIRECTORY_END.len();
@@ -102,6 +104,14 @@ pub struct LocalFile {
     pub file_name: String,
     pub extra_field_length: u16,
     pub extra_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct ExtendedInfoField {
+    pub uncompressed_size: u64,
+    pub compressed_size: u64,
+    pub relative_header_offset: Option<u64>,
+    pub disk_start_number: Option<u32>,
 }
 
 #[repr(u16)]
@@ -370,6 +380,12 @@ impl CentralDirectoryRecord {
 
         Ok(record)
     }
+
+    pub fn zip64_extended_info(&self) -> Option<ExtendedInfoField> {
+        self.extra_bytes
+            .as_ref()
+            .and_then(|bytes| bytes.pread_with(0, scroll::LE).ok())
+    }
 }
 
 impl LocalFile {
@@ -465,6 +481,47 @@ impl LocalFile {
         }
 
         Ok(local_file)
+    }
+}
+
+impl<'a> scroll::ctx::TryFromCtx<'a, scroll::Endian> for ExtendedInfoField {
+    type Error = scroll::Error;
+
+    #[allow(unused_assignments)]
+    fn try_from_ctx(src: &'a [u8], ctx: scroll::Endian) -> scroll::Result<(Self, usize)> {
+        let offset = &mut 0;
+
+        let magic = src.gread_with::<u16>(offset, ctx)?;
+        if magic.to_le_bytes() != MAGIC_ZIP64_EIF {
+            return Err(scroll::Error::BadInput {
+                size: 0,
+                msg: "Invalid magic",
+            });
+        }
+
+        // size is a size of all blob
+        // uncompressed_size and compressed_size fields are required to persist
+        // so subtracting 16 bytes
+        let mut size = src.gread_with::<u16>(offset, ctx)?.saturating_sub(16);
+
+        let mut data = Self {
+            uncompressed_size: src.gread_with(offset, ctx)?,
+            compressed_size: src.gread_with(offset, ctx)?,
+            relative_header_offset: None,
+            disk_start_number: None,
+        };
+
+        if size != 0 {
+            data.relative_header_offset = Some(src.gread_with(offset, ctx)?);
+            size = size.saturating_sub(8);
+        }
+
+        if size != 0 {
+            data.disk_start_number = Some(src.gread_with(offset, ctx)?);
+            size = size.saturating_sub(4);
+        }
+
+        Ok((data, *offset))
     }
 }
 
@@ -585,5 +642,30 @@ mod tests {
         assert_eq!(local_file.file_name, "test.txt");
         assert_eq!(local_file.file_name_length, 8);
         assert_eq!(local_file.extra_field_length, 28);
+    }
+
+    #[test]
+    fn test_zip64_extra_field() {
+        let input: [u8; 100] = [
+            0x50, 0x4B, 0x01, 0x02, 0x2D, 0x03, 0x2D, 0x00, 0x00, 0x00, 0x08, 0x00, 0x20, 0x4D,
+            0x29, 0x36, 0x34, 0xFE, 0xA5, 0x9B, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x1A, 0x00, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xA4, 0x81,
+            0xFF, 0xFF, 0xFF, 0xFF, 0x6B, 0x65, 0x72, 0x6E, 0x65, 0x6C, 0x63, 0x61, 0x63, 0x68,
+            0x65, 0x2E, 0x72, 0x65, 0x6C, 0x65, 0x61, 0x73, 0x65, 0x2E, 0x69, 0x70, 0x61, 0x64,
+            0x37, 0x62, 0x01, 0x00, 0x18, 0x00, 0xD8, 0xEB, 0xDE, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xCE, 0x9C, 0xDE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x76, 0xC5, 0xE4, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+
+        let cd_record = CentralDirectoryRecord::parse(&input[..], false).unwrap();
+        assert_eq!(cd_record.crc32, 0x9BA5FE34);
+        assert_eq!(cd_record.compressed_size, 0xFFFFFFFF);
+        assert_eq!(cd_record.uncompressed_size, 0xFFFFFFFF);
+
+        let extra_info = cd_record.zip64_extended_info().unwrap();
+        assert_eq!(extra_info.uncompressed_size, 0xDEEBD8);
+        assert_eq!(extra_info.compressed_size, 0xDE9CCE);
+        assert_eq!(extra_info.relative_header_offset, Some(0xE4C57614));
+        assert_eq!(extra_info.disk_start_number, None);
     }
 }

@@ -10,3 +10,4 @@ repository.workspace = true
 
 [dependencies]
 thiserror = "2.0.12"
+scroll = "0.13.0"
