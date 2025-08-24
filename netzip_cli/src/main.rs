@@ -43,7 +43,7 @@ async fn main() {
                 pb.finish();
                 eprintln!("{e}");
             }
-            Ok(zip) => match zip.download_files(files).await {
+            Ok(zip) => match zip.download_files_to_vec(files).await {
                 Err(e) => {
                     pb.finish();
                     eprintln!("{e}");

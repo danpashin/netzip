@@ -1,9 +1,13 @@
-use std::io::Read;
-
+use async_compression::tokio::bufread::{Deflate64Decoder, DeflateDecoder};
 use bytes::Bytes;
-use flate2::bufread::DeflateDecoder;
-use netzip_parser::{CentralDirectoryEnd, CentralDirectoryRecord, LocalFile, ZipError};
+use futures_util::TryStreamExt;
+use netzip_parser::{
+    CentralDirectoryEnd, CentralDirectoryRecord, CompressionMethod, LocalFile, ZipError,
+};
+use std::{io::Error as StdError, pin::Pin};
 use thiserror::Error;
+use tokio::io::AsyncRead;
+use tokio_util::io::StreamReader;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -17,6 +21,8 @@ pub enum Error {
     UnsupportCompression(u16),
     #[error("Downloaded data is corrupted. Expected {0} CRC-32 hash, got {1}")]
     DataCorruption(u32, u32),
+    #[error("I/O error encountered: {0}")]
+    IoError(std::io::Error),
 }
 
 pub struct RemoteZip {
@@ -118,22 +124,29 @@ impl RemoteZip {
     /// # Arguments
     ///
     /// * `paths` - A vector of file paths/names to download from the ZIP
+    /// * `file_handler` - Handler of the file stream.
+    ///   As file can be big, it's better to process it asynchronously.
     ///
     /// # Returns
     ///
-    /// A Result containing either a vector of tuples with (LocalFile metadata, file contents as bytes)
+    /// A Result containing either a vector of types defined by user
     /// or an Error if any file could not be downloaded or decompressed
-    pub async fn download_files(
+    pub async fn download_files<H, F, R>(
         &self,
         paths: Vec<String>,
-    ) -> Result<Vec<(LocalFile, Vec<u8>)>, Error> {
+        mut file_handler: H,
+    ) -> Result<Vec<R>, Error>
+    where
+        F: Future<Output = R>,
+        H: FnMut(LocalFile, Pin<Box<dyn AsyncRead + Send>>) -> F,
+    {
         let needed_cd_records: Vec<&CentralDirectoryRecord> = self
             .central_directory
             .iter()
             .filter(|x| paths.contains(&x.file_name))
             .collect();
 
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(paths.len());
 
         for cd_record in needed_cd_records {
             let lfh_end_offset = cd_record.file_header_offset
@@ -148,8 +161,8 @@ impl RemoteZip {
                 ))
                 .await?;
 
-            let mut lfh = LocalFile::parse(&lfh_bytes)
-                .map_err(|e| Error::ParserError(self.url.clone(), e))?;
+            let mut lfh =
+                LocalFile::parse(lfh_bytes).map_err(|e| Error::ParserError(self.url.clone(), e))?;
 
             // All these fields will always be zero when file was compressed with streaming
             if lfh.gp_bit_flag >> 3 & 1 == 1 {
@@ -172,52 +185,78 @@ impl RemoteZip {
                 uncompressed_size = extended_info.uncompressed_size;
             }
 
-            let download_chunk = |end_offset: u64| async move {
-                self.ranged_request(&format!(
-                    "bytes={}-{}",
-                    data_offset,
-                    data_offset as u64 + end_offset.saturating_sub(1)
-                ))
-                .await
-            };
-
-            let check_crc = |data: &[u8]| {
-                let checksum = crc32fast::hash(data);
-                if checksum != lfh.crc32 {
-                    return Err(Error::DataCorruption(lfh.crc32, checksum));
-                }
-
-                Ok(())
-            };
-
-            match lfh.compression_method {
-                netzip_parser::CompressionMethod::Deflate
-                | netzip_parser::CompressionMethod::Deflate64 => {
-                    let compressed_data: &[u8] = &download_chunk(compressed_size).await?;
-
-                    let mut decoder = DeflateDecoder::new(compressed_data);
-                    let mut decoded = Vec::with_capacity(uncompressed_size as usize);
-                    decoder
-                        .read_to_end(&mut decoded)
-                        .map_err(|e| Error::DecompressionError(self.url.clone(), e.to_string()))?;
-
-                    check_crc(&decoded)?;
-
-                    out.push((lfh, decoded));
-                }
-                netzip_parser::CompressionMethod::Stored => {
-                    let data = download_chunk(uncompressed_size).await?;
-                    check_crc(&data)?;
-
-                    out.push((lfh, data.to_vec()));
-                }
-                netzip_parser::CompressionMethod::Unsupported(unsupported_id) => {
+            let data_size = match lfh.compression_method {
+                CompressionMethod::Unsupported(unsupported_id) => {
                     return Err(Error::UnsupportCompression(unsupported_id));
                 }
+                CompressionMethod::Stored => uncompressed_size,
+                _ => compressed_size,
+            };
+
+            let chunk_end = data_offset + data_size.saturating_sub(1);
+            let response = self
+                .http_client
+                .get(&self.url)
+                .header("Range", format!("bytes={data_offset}-{chunk_end}"))
+                .send()
+                .await
+                .map_err(|e| Error::NetworkError(self.url.clone(), e))?;
+
+            let url = self.url.clone();
+            let chunk_stream = response
+                .bytes_stream()
+                .map_err(move |e| StdError::other(Error::NetworkError(url.clone(), e)));
+            let chunk_reader = StreamReader::new(chunk_stream);
+
+            match lfh.compression_method {
+                CompressionMethod::Deflate => {
+                    let decoder = Box::pin(DeflateDecoder::new(chunk_reader));
+                    let result = file_handler(lfh, decoder).await;
+                    out.push(result);
+                }
+                CompressionMethod::Deflate64 => {
+                    let decoder = Box::pin(Deflate64Decoder::new(chunk_reader));
+                    let result = file_handler(lfh, decoder).await;
+                    out.push(result);
+                }
+                CompressionMethod::Stored => {
+                    let decoder = Box::pin(chunk_reader);
+                    let result = file_handler(lfh, decoder).await;
+                    out.push(result);
+                }
+                _ => {}
             }
         }
 
-        return Ok(out);
+        Ok(out)
+    }
+
+    /// Downloads and decompresses the specified files from the remote ZIP.
+    ///
+    /// # Arguments
+    ///
+    /// * `paths` - A vector of file paths/names to download from the ZIP
+    ///
+    /// # Returns
+    ///
+    /// A Result containing either a vector of tuples with (LocalFile metadata, file contents as bytes)
+    /// or an Error if any file could not be downloaded or decompressed
+    pub async fn download_files_to_vec(
+        &self,
+        paths: Vec<String>,
+    ) -> Result<Vec<(LocalFile, Vec<u8>)>, Error> {
+        let files = self
+            .download_files(paths, |file, mut stream| async move {
+                let mut data = Vec::new();
+                tokio::io::copy(&mut stream, &mut data)
+                    .await
+                    .map_err(Error::IoError)?;
+
+                Ok((file, data))
+            })
+            .await?;
+
+        files.into_iter().collect()
     }
 
     async fn ranged_request(&self, range_string: &str) -> Result<Bytes, Error> {
