@@ -9,5 +9,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-thiserror = "2.0.12"
+thiserror = "2.0.18"
 scroll = "0.13.0"

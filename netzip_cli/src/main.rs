@@ -31,7 +31,7 @@ enum Commands {
     },
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args = Args::parse();
     let pb = ProgressBar::new_spinner().with_message("Requesting data...");

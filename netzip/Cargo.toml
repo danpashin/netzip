@@ -10,11 +10,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-bytes = "1.10.1"
+bytes = "1.11.1"
 netzip_parser = { path = "../netzip_parser" }
-reqwest = { version = "0.12.15", features = ["stream"] }
-thiserror = "2.0.12"
-tokio = { version = "1.47.1", default-features = false, features = ["io-std"] }
-futures-util = "0.3.31"
-tokio-util = "0.7.16"
-async-compression = { version = "0.4.28", default-features = false, features = ["tokio", "deflate", "deflate64"] }
+reqwest = { version = "0.13.2", features = ["stream"] }
+thiserror = "2.0.18"
+tokio = { version = "1.49.0", default-features = false }
+futures-util = { version = "0.3.31", default-features = false }
+tokio-util = "0.7.18"
+async-compression = { version = "0.4.39", default-features = false, features = ["tokio", "deflate", "deflate64"] }
