@@ -17,10 +17,16 @@ repository.workspace = true
 name = "netzip"
 path = "src/main.rs"
 
+[features]
+default = ["rustls"]
+rustls = ["netzip/rustls"]
+native-tls = ["netzip/native-tls"]
+native-tls-vendored = ["netzip/native-tls-vendored"]
+
 [dependencies]
-clap = { version = "4.5.57", features = ["derive"] }
-indicatif = "0.18.3"
-tokio = { version = "1.49.0", features = ["macros", "rt"] }
-netzip = { path = "../netzip" }
+clap = { version = "4.5.60", features = ["derive"] }
+indicatif = "0.18.4"
+tokio = { version = "1.50.0", features = ["macros", "rt"] }
+netzip = { path = "../netzip", default-features = false }
 comfy-table = "7.2.2"
 bittenhumans = "1.0.0"
