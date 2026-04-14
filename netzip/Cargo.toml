@@ -31,4 +31,4 @@ features = ["tokio", "deflate", "deflate64"]
 [dependencies.reqwest]
 version = "0.13.2"
 default-features = false
-features = ["stream", "http2", "system-proxy"]
+features = ["stream", "system-proxy"]
