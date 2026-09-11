@@ -4,6 +4,8 @@ use futures_util::TryStreamExt;
 use netzip_parser::{
     CentralDirectoryEnd, CentralDirectoryRecord, CompressionMethod, LocalFile, ZipError,
 };
+use reqwest::{Response, StatusCode};
+use std::time::Duration;
 use std::{io::Error as StdError, pin::Pin};
 use thiserror::Error;
 use tokio::io::AsyncRead;
@@ -45,9 +47,9 @@ impl RemoteZip {
     /// A Result containing either the initialized RemoteZip instance or an Error
     pub async fn get_using(url: &str, http_client: reqwest::Client) -> Result<Self, Error> {
         let min_cde_bytes = ranged_request(
+            &http_client,
             url,
             &format!("bytes=-{}", netzip_parser::EOCD_MIN_SIZE),
-            http_client.clone(),
         )
         .await?;
 
@@ -56,9 +58,9 @@ impl RemoteZip {
         } else {
             // There might be a comment, retry with an offset and search for the EOCD
             let cde_haystack = ranged_request(
+                &http_client,
                 url,
                 &format!("bytes=-{}", netzip_parser::EOCD_MIN_SIZE + 1024),
-                http_client.clone(),
             )
             .await?;
 
@@ -67,13 +69,13 @@ impl RemoteZip {
         };
 
         let cd_bytes = ranged_request(
+            &http_client,
             url,
             &format!(
                 "bytes={}-{}",
                 cde.central_directory_offset,
                 cde.central_directory_offset + cde.directory_size
             ),
-            http_client.clone(),
         )
         .await?;
 
@@ -260,29 +262,49 @@ impl RemoteZip {
     }
 
     async fn ranged_request(&self, range_string: &str) -> Result<Bytes, Error> {
-        self.http_client
-            .get(&self.url)
-            .header("Range", range_string)
-            .send()
-            .await
-            .map_err(|e| Error::NetworkError(self.url.clone(), e))?
-            .bytes()
-            .await
-            .map_err(|e| Error::NetworkError(self.url.clone(), e))
+        ranged_request(&self.http_client, &self.url, range_string).await
     }
 }
 
 async fn ranged_request(
+    client: &reqwest::Client,
     url: &str,
     range_string: &str,
-    client: reqwest::Client,
 ) -> Result<Bytes, Error> {
-    client
-        .get(url)
-        .header("Range", range_string)
-        .send()
-        .await
-        .map_err(|e| Error::NetworkError(url.into(), e))?
+    let make_request = async || {
+        client
+            .get(url)
+            .header("Range", range_string)
+            .send()
+            .await
+            .map_err(|e| Error::NetworkError(url.into(), e))
+    };
+
+    let mut response: Response;
+    loop {
+        response = make_request().await?;
+        match response.error_for_status_ref() {
+            Ok(_) => break,
+            Err(err) => {
+                if let Some(StatusCode::TOO_MANY_REQUESTS) = err.status() {
+                    let after = response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|val| val.to_str().ok())
+                        .and_then(|val| val.parse().ok());
+
+                    if let Some(after) = after {
+                        tokio::time::sleep(Duration::from_secs(after)).await;
+                        continue;
+                    }
+                }
+
+                return Err(Error::NetworkError(url.into(), err));
+            }
+        }
+    }
+
+    response
         .bytes()
         .await
         .map_err(|e| Error::NetworkError(url.into(), e))
