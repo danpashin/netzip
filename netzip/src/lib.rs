@@ -1,10 +1,11 @@
 use async_compression::tokio::bufread::{Deflate64Decoder, DeflateDecoder};
-use bytes::Bytes;
 use futures_util::TryStreamExt;
 use netzip_parser::{
     CentralDirectoryEnd, CentralDirectoryRecord, CompressionMethod, LocalFile, ZipError,
 };
 use reqwest::{Response, StatusCode};
+use std::fmt::{Display, Formatter};
+use std::ops::RangeInclusive;
 use std::time::Duration;
 use std::{io::Error as StdError, pin::Pin};
 use thiserror::Error;
@@ -23,6 +24,8 @@ pub enum Error {
     UnsupportCompression(u16),
     #[error("Downloaded data is corrupted. Expected {0} CRC-32 hash, got {1}")]
     DataCorruption(u32, u32),
+    #[error("Request to {0} failed. Server responded with {1}, expected to get 206.")]
+    UnexpectedHttpStatus(String, StatusCode),
     #[error("I/O error encountered: {0}")]
     IoError(std::io::Error),
 }
@@ -31,6 +34,11 @@ pub struct RemoteZip {
     url: String,
     http_client: reqwest::Client,
     central_directory: Vec<CentralDirectoryRecord>,
+}
+
+enum HttpRange {
+    Closed(RangeInclusive<u32>),
+    End(usize),
 }
 
 impl RemoteZip {
@@ -49,7 +57,7 @@ impl RemoteZip {
         let min_cde_bytes = ranged_request(
             &http_client,
             url,
-            &format!("bytes=-{}", netzip_parser::EOCD_MIN_SIZE),
+            HttpRange::End(netzip_parser::EOCD_MIN_SIZE),
         )
         .await?;
 
@@ -60,7 +68,7 @@ impl RemoteZip {
             let cde_haystack = ranged_request(
                 &http_client,
                 url,
-                &format!("bytes=-{}", netzip_parser::EOCD_MIN_SIZE + 1024),
+                HttpRange::End(netzip_parser::EOCD_MIN_SIZE + 1024),
             )
             .await?;
 
@@ -71,10 +79,8 @@ impl RemoteZip {
         let cd_bytes = ranged_request(
             &http_client,
             url,
-            &format!(
-                "bytes={}-{}",
-                cde.central_directory_offset,
-                cde.central_directory_offset + cde.directory_size
+            HttpRange::Closed(
+                cde.central_directory_offset..=cde.central_directory_offset + cde.directory_size,
             ),
         )
         .await?;
@@ -157,9 +163,8 @@ impl RemoteZip {
                 + cd_record.file_name_length as u32
                 + cd_record.file_comment_length as u32;
             let lfh_bytes = &self
-                .ranged_request(&format!(
-                    "bytes={}-{}",
-                    cd_record.file_header_offset, lfh_end_offset
+                .ranged_request(HttpRange::Closed(
+                    cd_record.file_header_offset..=lfh_end_offset,
                 ))
                 .await?;
 
@@ -261,20 +266,21 @@ impl RemoteZip {
         files.into_iter().collect()
     }
 
-    async fn ranged_request(&self, range_string: &str) -> Result<Bytes, Error> {
-        ranged_request(&self.http_client, &self.url, range_string).await
+    async fn ranged_request(&self, range: HttpRange) -> Result<Vec<u8>, Error> {
+        ranged_request(&self.http_client, &self.url, range).await
     }
 }
 
 async fn ranged_request(
     client: &reqwest::Client,
     url: &str,
-    range_string: &str,
-) -> Result<Bytes, Error> {
+    range: HttpRange,
+) -> Result<Vec<u8>, Error> {
+    let range_string = format!("bytes={range}");
     let make_request = async || {
         client
             .get(url)
-            .header("Range", range_string)
+            .header("Range", &range_string)
             .send()
             .await
             .map_err(|e| Error::NetworkError(url.into(), e))
@@ -304,8 +310,66 @@ async fn ranged_request(
         }
     }
 
-    response
-        .bytes()
-        .await
-        .map_err(|e| Error::NetworkError(url.into(), e))
+    // recheck if server supports ranged requests
+    // even 200 OK means partial range is not supported, so check is strictly bounded to 206 code
+    let status = response.status();
+    if status != StatusCode::PARTIAL_CONTENT {
+        return Err(Error::UnexpectedHttpStatus(url.into(), status));
+    }
+
+    let mut next_chunk = async || {
+        response
+            .chunk()
+            .await
+            .map_err(|e| Error::NetworkError(url.into(), e))
+    };
+
+    // Server can respond with 206 but it doesn't mean it really sends content which was requested
+    // take as much as range states
+    let mut response_data = Vec::with_capacity(range.len());
+    while let Some(chunk) = next_chunk().await? {
+        response_data.extend_from_slice(chunk.as_ref());
+    }
+
+    Ok(response_data)
+}
+
+impl Display for HttpRange {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Closed(range) => write!(f, "{}-{}", range.start(), range.end()),
+            Self::End(end) => write!(f, "-{end}"),
+        }
+    }
+}
+
+impl HttpRange {
+    #[must_use]
+    fn len(&self) -> usize {
+        match self {
+            Self::Closed(range) => (range.end() - range.start()) as usize,
+            Self::End(end) => *end,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HttpRange;
+    use netzip_parser::EOCD_MIN_SIZE;
+
+    #[test]
+    fn range_fmt() {
+        let range = HttpRange::End(EOCD_MIN_SIZE).to_string();
+        assert_eq!(range, format!("-{EOCD_MIN_SIZE}"));
+
+        let range = HttpRange::Closed(10..=20).to_string();
+        assert_eq!(range, "10-20");
+    }
+
+    #[test]
+    fn range_len() {
+        assert_eq!(HttpRange::End(EOCD_MIN_SIZE).len(), EOCD_MIN_SIZE);
+        assert_eq!(HttpRange::Closed(10..=20).len(), 10);
+    }
 }
