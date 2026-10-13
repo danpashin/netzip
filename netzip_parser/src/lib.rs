@@ -181,24 +181,27 @@ impl CentralDirectoryEnd {
             comment: None,
         };
 
-        if out.comment_length > 0 {
-            let comment_end = EOCD_COMMENT_START + out.comment_length as usize;
-
-            if comment_end > central_dir_buf.len() {
-                return Err(ZipError::MissingData("EOCD Comment"));
-            } else if comment_end < central_dir_buf.len() {
-                return Err(ZipError::ExtraneousData("EOCD Comment"));
-            }
-
-            out.comment = Some(
-                String::from_utf8_lossy(&central_dir_buf[EOCD_COMMENT_START..comment_end])
-                    .into_owned(),
-            );
-        } else {
+        if out.comment_length == 0 {
             if central_dir_buf.len() != EOCD_MIN_SIZE {
                 return Err(ZipError::ExtraneousData("EOCD Comment (comment length 0)"));
             }
+            return Ok(out);
         }
+
+        let comment_end = match EOCD_COMMENT_START.checked_add(out.comment_length as usize) {
+            Some(end) if end > central_dir_buf.len() => {
+                return Err(ZipError::MissingData("EOCD Comment"));
+            }
+            Some(end) if end < central_dir_buf.len() => {
+                return Err(ZipError::ExtraneousData("EOCD Comment"));
+            }
+            Some(end) => end,
+            None => return Err(ZipError::MalformedData("EOCD Comment")),
+        };
+
+        out.comment = Some(
+            String::from_utf8_lossy(&central_dir_buf[EOCD_COMMENT_START..comment_end]).into_owned(),
+        );
 
         Ok(out)
     }
@@ -356,26 +359,33 @@ impl CentralDirectoryRecord {
 
         let mut current_offset = CDR_FILE_NAME_START;
 
-        record.file_name = String::from_utf8_lossy(
-            &record_buf[current_offset..current_offset + file_name_length as usize],
-        )
-        .into_owned();
+        let Some(name) = record_buf.get(current_offset..current_offset + file_name_length as usize)
+        else {
+            return Err(ZipError::MalformedData("CDR filename"));
+        };
+
+        record.file_name = String::from_utf8_lossy(name).into_owned();
         current_offset += file_name_length as usize;
 
         if extra_field_length > 0 {
-            record.extra_bytes = Some(
-                record_buf[current_offset..current_offset + extra_field_length as usize].to_vec(),
-            );
+            let Some(extra) =
+                record_buf.get(current_offset..current_offset + extra_field_length as usize)
+            else {
+                return Err(ZipError::MalformedData("CDR extra bytes"));
+            };
+
+            record.extra_bytes = Some(extra.to_vec());
             current_offset += extra_field_length as usize;
         }
 
         if file_comment_length > 0 {
-            record.comment = Some(
-                String::from_utf8_lossy(
-                    &record_buf[current_offset..current_offset + file_comment_length as usize],
-                )
-                .into_owned(),
-            );
+            let Some(comment) =
+                record_buf.get(current_offset..current_offset + file_comment_length as usize)
+            else {
+                return Err(ZipError::MalformedData("CDR extra bytes"));
+            };
+
+            record.comment = Some(String::from_utf8_lossy(comment).into_owned());
         }
 
         Ok(record)
@@ -467,10 +477,12 @@ impl LocalFile {
         };
 
         let mut current_offset = LFH_FILE_NAME_START;
-        local_file.file_name = String::from_utf8_lossy(
-            &file_buf[current_offset..current_offset + file_name_length as usize],
-        )
-        .into_owned();
+
+        let Some(name) = file_buf.get(current_offset..current_offset + file_name_length as usize)
+        else {
+            return Err(ZipError::MalformedData("LFH filename"));
+        };
+        local_file.file_name = String::from_utf8_lossy(name).into_owned();
         current_offset += file_name_length as usize;
 
         if extra_field_length > 0 {

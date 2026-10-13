@@ -7,7 +7,10 @@ use netzip_parser::{
     CentralDirectoryEnd, CentralDirectoryRecord, CompressionMethod, LocalFile, ZipError,
 };
 use reqwest::StatusCode;
-use std::{io::Error as StdError, pin::Pin};
+use std::{
+    io::{Error as StdError, ErrorKind as StdEKind},
+    pin::Pin,
+};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
@@ -65,13 +68,15 @@ impl RemoteZip {
                 .map_err(|e| Error::ParserError(url.into(), e))?
         };
 
+        let cd_offset = cde.central_directory_offset;
+        let cd_end = cd_offset
+            .checked_add(cde.directory_size)
+            .ok_or_else(malformed_fields_error)?;
+
         let cd_bytes = http_client
             .get_range_body(
                 url,
-                HttpRange::Closed(
-                    u64::from(cde.central_directory_offset),
-                    u64::from(cde.central_directory_offset + cde.directory_size),
-                ),
+                HttpRange::Closed(u64::from(cd_offset), u64::from(cd_end)),
             )
             .await?;
 
@@ -147,20 +152,17 @@ impl RemoteZip {
         let mut out = Vec::with_capacity(paths.len());
 
         for cd_record in needed_cd_records {
-            let lfh_end_offset = cd_record.file_header_offset
-                + netzip_parser::LFH_MIN_SIZE as u32
-                + cd_record.extra_field_length as u32
-                + cd_record.file_name_length as u32
-                + cd_record.file_comment_length as u32;
+            let fh_offset = cd_record.file_header_offset as u64;
+            let lfh_end_offset = fh_offset
+                .checked_add(netzip_parser::LFH_MIN_SIZE as u64)
+                .and_then(|off| off.checked_add(cd_record.extra_field_length as u64))
+                .and_then(|off| off.checked_add(cd_record.file_name_length as u64))
+                .and_then(|off| off.checked_add(cd_record.file_comment_length as u64))
+                .ok_or_else(malformed_fields_error)?;
+
             let lfh_bytes = self
                 .http_client
-                .get_range_body(
-                    &self.url,
-                    HttpRange::Closed(
-                        u64::from(cd_record.file_header_offset),
-                        u64::from(lfh_end_offset),
-                    ),
-                )
+                .get_range_body(&self.url, HttpRange::Closed(fh_offset, lfh_end_offset))
                 .await?;
 
             let mut lfh = LocalFile::parse(&lfh_bytes)
@@ -175,8 +177,10 @@ impl RemoteZip {
 
             // The set of extra fields in the CD do not need to be identical with LFH ones
             // macOS has 16 bytes in LFH and 12 in CD
-            let data_offset = lfh_end_offset as u64 - cd_record.extra_field_length as u64
-                + lfh.extra_field_length as u64;
+            let data_offset = lfh_end_offset
+                .saturating_sub(cd_record.extra_field_length as u64)
+                .checked_add(lfh.extra_field_length as u64)
+                .ok_or_else(malformed_fields_error)?;
 
             let mut compressed_size = lfh.compressed_size as u64;
             let mut uncompressed_size = lfh.uncompressed_size as u64;
@@ -195,7 +199,10 @@ impl RemoteZip {
                 _ => compressed_size,
             };
 
-            let chunk_end = data_offset + data_size.saturating_sub(1);
+            let chunk_end = data_offset
+                .checked_add(data_size.saturating_sub(1))
+                .ok_or_else(malformed_fields_error)?;
+
             let response = self
                 .http_client
                 .get_range(&self.url, HttpRange::Closed(data_offset, chunk_end))
@@ -247,9 +254,12 @@ impl RemoteZip {
         let files = self
             .download_files(paths, |file, stream| async move {
                 let mut data = Vec::with_capacity(file.uncompressed_size as usize);
-                tokio::io::copy(&mut stream.take(u64::from(file.uncompressed_size)), &mut data)
-                    .await
-                    .map_err(Error::IoError)?;
+                tokio::io::copy(
+                    &mut stream.take(u64::from(file.uncompressed_size)),
+                    &mut data,
+                )
+                .await
+                .map_err(Error::IoError)?;
 
                 Ok((file, data))
             })
@@ -257,4 +267,11 @@ impl RemoteZip {
 
         files.into_iter().collect()
     }
+}
+
+fn malformed_fields_error() -> Error {
+    Error::IoError(StdError::new(
+        StdEKind::InvalidData,
+        "zip fields are malformed",
+    ))
 }
