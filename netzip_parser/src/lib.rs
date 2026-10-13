@@ -1,3 +1,10 @@
+#![deny(clippy::pedantic)]
+#![allow(
+    clippy::doc_markdown,
+    clippy::missing_errors_doc,
+    clippy::too_many_lines
+)]
+
 use scroll::Pread;
 use thiserror::Error;
 
@@ -8,7 +15,7 @@ const MAGIC_ZIP64_EIF: [u8; 2] = [0x01, 0x00];
 
 pub const EOCD_MIN_SIZE: usize = 22;
 const EOCD_BASE_OFFSET: usize = MAGIC_CENTRAL_DIRECTORY_END.len();
-const EOCD_DISK_NUMBER_OFFSET: usize = EOCD_BASE_OFFSET + 0;
+const EOCD_DISK_NUMBER_OFFSET: usize = EOCD_BASE_OFFSET;
 const EOCD_DISK_START_OFFSET: usize = EOCD_BASE_OFFSET + 2;
 const EOCD_RECORD_COUNT_DISK_OFFSET: usize = EOCD_BASE_OFFSET + 4;
 const EOCD_RECORD_COUNT_TOTAL_OFFSET: usize = EOCD_BASE_OFFSET + 6;
@@ -19,7 +26,7 @@ const EOCD_COMMENT_START: usize = EOCD_BASE_OFFSET + 18;
 
 pub const CDR_MIN_SIZE: usize = 46;
 const CDR_BASE_OFFSET: usize = MAGIC_CENTRAL_DIRECTORY_RECORD.len();
-const CDR_VERSION_CREATED_OFFSET: usize = CDR_BASE_OFFSET + 0;
+const CDR_VERSION_CREATED_OFFSET: usize = CDR_BASE_OFFSET;
 const CDR_VERSION_REQUIRED_OFFSET: usize = CDR_BASE_OFFSET + 2;
 const CDR_BIT_FLAG_OFFSET: usize = CDR_BASE_OFFSET + 4;
 const CDR_COMPRESSION_METHOD_OFFSET: usize = CDR_BASE_OFFSET + 6;
@@ -39,7 +46,7 @@ const CDR_FILE_NAME_START: usize = CDR_BASE_OFFSET + 42;
 
 pub const LFH_MIN_SIZE: usize = 30;
 const LFH_BASE_OFFSET: usize = MAGIC_LOCAL_FILE.len();
-const LFH_VERSION_OFFSET: usize = LFH_BASE_OFFSET + 0;
+const LFH_VERSION_OFFSET: usize = LFH_BASE_OFFSET;
 const LFH_BIT_FLAG_OFFSET: usize = LFH_BASE_OFFSET + 2;
 const LFH_COMPRESSION_METHOD_OFFSET: usize = LFH_BASE_OFFSET + 4;
 const LFH_MOD_TIME_OFFSET: usize = LFH_BASE_OFFSET + 6;
@@ -212,9 +219,9 @@ impl CentralDirectoryEnd {
             if haystack[idx] == MAGIC_CENTRAL_DIRECTORY_END[magic_cursor] {
                 if magic_cursor == 0 {
                     return CentralDirectoryEnd::parse(&haystack[idx - magic_cursor..]);
-                } else {
-                    magic_cursor -= 1;
                 }
+
+                magic_cursor -= 1;
             } else {
                 magic_cursor = MAGIC_CENTRAL_DIRECTORY_END.len() - 1;
             }
@@ -391,6 +398,7 @@ impl CentralDirectoryRecord {
         Ok(record)
     }
 
+    #[must_use]
     pub fn zip64_extended_info(&self) -> Option<ExtendedInfoField> {
         self.extra_bytes
             .as_ref()

@@ -1,3 +1,6 @@
+#![deny(clippy::pedantic)]
+#![allow(clippy::doc_markdown, clippy::missing_errors_doc)]
+
 mod request_ext;
 
 use self::request_ext::{HttpRange, RangedRequest};
@@ -109,7 +112,8 @@ impl RemoteZip {
     /// # Returns
     ///
     /// A reference to the vector of CentralDirectoryRecord entries
-    pub fn records(&self) -> &Vec<CentralDirectoryRecord> {
+    #[must_use]
+    pub fn records(&self) -> &[CentralDirectoryRecord] {
         &self.central_directory
     }
 
@@ -118,6 +122,7 @@ impl RemoteZip {
     /// # Returns
     ///
     /// A mutable reference to the vector of CentralDirectoryRecord entries
+    #[must_use]
     pub fn records_mut(&mut self) -> &mut Vec<CentralDirectoryRecord> {
         &mut self.central_directory
     }
@@ -152,12 +157,11 @@ impl RemoteZip {
         let mut out = Vec::with_capacity(paths.len());
 
         for cd_record in needed_cd_records {
-            let fh_offset = cd_record.file_header_offset as u64;
+            let fh_offset = u64::from(cd_record.file_header_offset);
             let lfh_end_offset = fh_offset
                 .checked_add(netzip_parser::LFH_MIN_SIZE as u64)
-                .and_then(|off| off.checked_add(cd_record.extra_field_length as u64))
-                .and_then(|off| off.checked_add(cd_record.file_name_length as u64))
-                .and_then(|off| off.checked_add(cd_record.file_comment_length as u64))
+                .and_then(|off| off.checked_add(u64::from(cd_record.extra_field_length)))
+                .and_then(|off| off.checked_add(u64::from(cd_record.file_name_length)))
                 .ok_or_else(malformed_fields_error)?;
 
             let lfh_bytes = self
@@ -168,7 +172,7 @@ impl RemoteZip {
             let mut lfh = LocalFile::parse(&lfh_bytes)
                 .map_err(|e| Error::ParserError(self.url.clone(), e))?;
 
-            // All these fields will always be zero when file was compressed with streaming
+            // All these fields will always be zero when file was compressed in streaming mode
             if lfh.gp_bit_flag >> 3 & 1 == 1 {
                 lfh.crc32 = cd_record.crc32;
                 lfh.compressed_size = cd_record.compressed_size;
@@ -178,12 +182,12 @@ impl RemoteZip {
             // The set of extra fields in the CD do not need to be identical with LFH ones
             // macOS has 16 bytes in LFH and 12 in CD
             let data_offset = lfh_end_offset
-                .saturating_sub(cd_record.extra_field_length as u64)
-                .checked_add(lfh.extra_field_length as u64)
+                .saturating_sub(u64::from(cd_record.extra_field_length))
+                .checked_add(u64::from(lfh.extra_field_length))
                 .ok_or_else(malformed_fields_error)?;
 
-            let mut compressed_size = lfh.compressed_size as u64;
-            let mut uncompressed_size = lfh.uncompressed_size as u64;
+            let mut compressed_size = u64::from(lfh.compressed_size);
+            let mut uncompressed_size = u64::from(lfh.uncompressed_size);
 
             // zip64 sets these fields to 0xFFFFFFFF
             if let Some(extended_info) = cd_record.zip64_extended_info() {
@@ -230,7 +234,7 @@ impl RemoteZip {
                     let result = file_handler(lfh, decoder).await;
                     out.push(result);
                 }
-                _ => {}
+                CompressionMethod::Unsupported(_) => {}
             }
         }
 

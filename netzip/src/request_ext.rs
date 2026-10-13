@@ -4,6 +4,7 @@ use futures_util::StreamExt;
 use reqwest::{Response, StatusCode};
 use std::{
     fmt::{Display, Formatter},
+    io::{Error as StdError, ErrorKind as StdEKind},
     time::Duration,
 };
 
@@ -11,8 +12,11 @@ pub(crate) trait RangedRequest {
     async fn get_range(&self, url: &str, range: HttpRange) -> Result<Response, Error>;
 
     async fn get_range_body(&self, url: &str, range: HttpRange) -> Result<Bytes, Error> {
+        let limit = usize::try_from(range.len())
+            .map_err(|_| Error::IoError(StdEKind::OutOfMemory.into()))?;
+
         let response = self.get_range(url, range.clone()).await?;
-        response.body_with_limit(range.len() as usize).await
+        response.body_with_limit(limit).await
     }
 }
 
@@ -79,10 +83,20 @@ impl ResponseExt for Response {
             };
 
             if buffer.len() + chunk.len() > limit {
-                break;
+                return Err(Error::IoError(StdError::new(
+                    StdEKind::InvalidData,
+                    "HTTP response exceeds requested range",
+                )));
             }
 
             buffer.extend_from_slice(&chunk);
+        }
+
+        if buffer.len() != limit {
+            return Err(Error::IoError(StdError::new(
+                StdEKind::UnexpectedEof,
+                "HTTP response shorter than requested range",
+            )));
         }
 
         Ok(buffer.freeze())
