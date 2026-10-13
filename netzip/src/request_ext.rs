@@ -131,6 +131,6 @@ mod tests {
     #[test]
     fn range_len() {
         assert_eq!(HttpRange::End(EOCD_MIN_SIZE).len(), EOCD_MIN_SIZE as u64);
-        assert_eq!(HttpRange::Closed(10, 20).len(), 10);
+        assert_eq!(HttpRange::Closed(10, 20).len(), 11);
     }
 }
