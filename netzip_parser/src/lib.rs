@@ -235,13 +235,23 @@ impl CentralDirectoryRecord {
     pub fn parse_many(records_buf: &[u8]) -> Result<Vec<Self>> {
         let mut out = Vec::new();
         let mut cursor = 0;
-        while cursor < records_buf.len() - 1 {
-            let current_record = Self::parse(&records_buf[cursor..], true)?;
-            cursor += CDR_MIN_SIZE
-                + current_record.file_comment_length as usize
-                + current_record.file_name_length as usize
-                + current_record.extra_field_length as usize;
-            out.push(current_record);
+        while cursor < records_buf.len() {
+            let remaining = records_buf
+                .get(cursor..)
+                .ok_or(ZipError::MalformedData("CDR cursor"))?;
+
+            let record = Self::parse(remaining, true)?;
+            let record_len = CDR_MIN_SIZE
+                .checked_add(usize::from(record.file_name_length))
+                .and_then(|n| n.checked_add(usize::from(record.extra_field_length)))
+                .and_then(|n| n.checked_add(usize::from(record.file_comment_length)))
+                .ok_or(ZipError::MalformedData("CDR length overflow"))?;
+
+            cursor = cursor
+                .checked_add(record_len)
+                .ok_or(ZipError::MalformedData("CDR cursor overflow"))?;
+
+            out.push(record);
         }
 
         Ok(out)

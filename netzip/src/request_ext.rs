@@ -22,7 +22,9 @@ pub(crate) trait RangedRequest {
 
 impl RangedRequest for reqwest::Client {
     async fn get_range(&self, url: &str, range: HttpRange) -> Result<Response, Error> {
-        let range_string = format!("bytes={range}");
+        const MAX_RETRIES: u8 = 5;
+
+        let range_string = range.to_string();
         let make_request = async || {
             self.get(url)
                 .header("Range", &range_string)
@@ -32,7 +34,16 @@ impl RangedRequest for reqwest::Client {
         };
 
         let mut response: Response;
+        let mut retries = 0;
         loop {
+            if retries > MAX_RETRIES {
+                return Err(Error::IoError(StdError::new(
+                    StdEKind::QuotaExceeded,
+                    "Reached max retries for 429 HTTP status",
+                )));
+            }
+            retries += 1;
+
             response = make_request().await?;
             match response.error_for_status_ref() {
                 Ok(_) => break,
@@ -62,6 +73,34 @@ impl RangedRequest for reqwest::Client {
             return Err(Error::UnexpectedHttpStatus(url.into(), status));
         }
 
+        let headers = response.headers();
+        let response_len = headers
+            .get("content-length")
+            .and_then(|len| len.to_str().ok())
+            .and_then(|len| len.parse::<u64>().ok());
+
+        match response_len {
+            Some(len) if len > range.len() => {
+                return Err(Error::IoError(StdError::new(
+                    StdEKind::FileTooLarge,
+                    "HTTP response exceeds requested range",
+                )));
+            }
+            Some(len) if len < range.len() => {
+                return Err(Error::IoError(StdError::new(
+                    StdEKind::UnexpectedEof,
+                    "HTTP response is shorter than requested range",
+                )));
+            }
+            Some(_) => {}
+            None => {
+                return Err(Error::IoError(StdError::new(
+                    StdEKind::UnexpectedEof,
+                    "HTTP response is shorter than requested range",
+                )));
+            }
+        };
+
         Ok(response)
     }
 }
@@ -84,7 +123,7 @@ impl ResponseExt for Response {
 
             if buffer.len() + chunk.len() > limit {
                 return Err(Error::IoError(StdError::new(
-                    StdEKind::InvalidData,
+                    StdEKind::FileTooLarge,
                     "HTTP response exceeds requested range",
                 )));
             }
@@ -95,7 +134,7 @@ impl ResponseExt for Response {
         if buffer.len() != limit {
             return Err(Error::IoError(StdError::new(
                 StdEKind::UnexpectedEof,
-                "HTTP response shorter than requested range",
+                "HTTP response is shorter than requested range",
             )));
         }
 
@@ -103,16 +142,18 @@ impl ResponseExt for Response {
     }
 }
 
-#[derive(Clone)]
+#[derive(Copy, Clone)]
 pub(crate) enum HttpRange {
-    Closed(u64, u64),
+    Inclusive { start: u64, end: u64 },
     End(usize),
 }
 
 impl Display for HttpRange {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bytes=")?;
+
         match self {
-            Self::Closed(start, end) => write!(f, "{start}-{end}"),
+            Self::Inclusive { start, end } => write!(f, "{start}-{end}"),
             Self::End(end) => write!(f, "-{end}"),
         }
     }
@@ -120,9 +161,29 @@ impl Display for HttpRange {
 
 impl HttpRange {
     #[must_use]
-    fn len(&self) -> u64 {
+    pub(crate) fn from_start_len(start: u64, len: u64) -> Option<Self> {
+        if len == 0 {
+            return None;
+        }
+
+        Some(Self::Inclusive {
+            start,
+            end: start.checked_add(len - 1)?,
+        })
+    }
+
+    #[must_use]
+    pub fn end(&self) -> u64 {
         match self {
-            Self::Closed(start, end) => end - start + 1,
+            Self::Inclusive { end, .. } => *end + 1,
+            Self::End(end) => *end as u64,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn len(&self) -> u64 {
+        match self {
+            Self::Inclusive { start, end } => end - start + 1,
             Self::End(end) => *end as u64,
         }
     }
@@ -136,15 +197,31 @@ mod tests {
     #[test]
     fn range_fmt() {
         let range = HttpRange::End(EOCD_MIN_SIZE).to_string();
-        assert_eq!(range, format!("-{EOCD_MIN_SIZE}"));
+        assert_eq!(range, format!("bytes=-{EOCD_MIN_SIZE}"));
 
-        let range = HttpRange::Closed(10, 20).to_string();
-        assert_eq!(range, "10-20");
+        let range = HttpRange::from_start_len(10, 10).unwrap().to_string();
+        assert_eq!(range, "bytes=10-19");
     }
 
     #[test]
     fn range_len() {
         assert_eq!(HttpRange::End(EOCD_MIN_SIZE).len(), EOCD_MIN_SIZE as u64);
-        assert_eq!(HttpRange::Closed(10, 20).len(), 11);
+        assert_eq!(
+            HttpRange::Inclusive {
+                start: 39252017,
+                end: 39317677
+            }
+            .len(),
+            65661
+        );
+
+        assert_eq!(
+            HttpRange::Inclusive {
+                start: 0,
+                end: 1023
+            }
+            .len(),
+            1024
+        );
     }
 }

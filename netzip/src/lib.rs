@@ -71,17 +71,11 @@ impl RemoteZip {
                 .map_err(|e| Error::ParserError(url.into(), e))?
         };
 
-        let cd_offset = cde.central_directory_offset;
-        let cd_end = cd_offset
-            .checked_add(cde.directory_size)
+        let cd_offset = u64::from(cde.central_directory_offset);
+        let cd_range = HttpRange::from_start_len(cd_offset, u64::from(cde.directory_size))
             .ok_or_else(malformed_fields_error)?;
 
-        let cd_bytes = http_client
-            .get_range_body(
-                url,
-                HttpRange::Closed(u64::from(cd_offset), u64::from(cd_end)),
-            )
-            .await?;
+        let cd_bytes = http_client.get_range_body(url, cd_range).await?;
 
         let cd_records = CentralDirectoryRecord::parse_many(&cd_bytes)
             .map_err(|e| Error::ParserError(url.into(), e))?;
@@ -158,15 +152,18 @@ impl RemoteZip {
 
         for cd_record in needed_cd_records {
             let fh_offset = u64::from(cd_record.file_header_offset);
-            let lfh_end_offset = fh_offset
-                .checked_add(netzip_parser::LFH_MIN_SIZE as u64)
-                .and_then(|off| off.checked_add(u64::from(cd_record.extra_field_length)))
+
+            let lfh_size = (netzip_parser::LFH_MIN_SIZE as u64)
+                .checked_add(u64::from(cd_record.extra_field_length))
                 .and_then(|off| off.checked_add(u64::from(cd_record.file_name_length)))
+                .ok_or_else(malformed_fields_error)?;
+
+            let lfh_range = HttpRange::from_start_len(fh_offset, lfh_size)
                 .ok_or_else(malformed_fields_error)?;
 
             let lfh_bytes = self
                 .http_client
-                .get_range_body(&self.url, HttpRange::Closed(fh_offset, lfh_end_offset))
+                .get_range_body(&self.url, lfh_range)
                 .await?;
 
             let mut lfh = LocalFile::parse(&lfh_bytes)
@@ -181,7 +178,8 @@ impl RemoteZip {
 
             // The set of extra fields in the CD do not need to be identical with LFH ones
             // macOS has 16 bytes in LFH and 12 in CD
-            let data_offset = lfh_end_offset
+            let data_offset = lfh_range
+                .end()
                 .saturating_sub(u64::from(cd_record.extra_field_length))
                 .checked_add(u64::from(lfh.extra_field_length))
                 .ok_or_else(malformed_fields_error)?;
@@ -203,14 +201,10 @@ impl RemoteZip {
                 _ => compressed_size,
             };
 
-            let chunk_end = data_offset
-                .checked_add(data_size.saturating_sub(1))
+            let data_range = HttpRange::from_start_len(data_offset, data_size)
                 .ok_or_else(malformed_fields_error)?;
 
-            let response = self
-                .http_client
-                .get_range(&self.url, HttpRange::Closed(data_offset, chunk_end))
-                .await?;
+            let response = self.http_client.get_range(&self.url, data_range).await?;
 
             let url = self.url.clone();
             let chunk_stream = response
